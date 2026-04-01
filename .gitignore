@@ -1,0 +1,59 @@
+# Build artifacts
+bin/
+obj/
+out/
+artifacts/
+TestResults/
+
+# User-specific IDE files
+*.user
+*.rsuser
+*.suo
+*.userprefs
+*.sln.docstates
+*.DotSettings.user
+
+# JetBrains Rider / IntelliJ
+.idea/
+
+# VS Code
+.vscode/
+
+# Logs
+*.log
+logs/
+
+# Local databases
+*.db
+*.db-journal
+*.sqlite
+*.sqlite3
+
+# Local environment / secrets
+.env
+.env.*
+!.env.example
+secrets.json
+appsettings.Local.json
+appsettings.*.local.json
+
+# OS files
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Docker local overrides
+docker-compose.override.yml
+
+# Coverage / reports
+coverage/
+coverage-report/
+*.coverage
+*.coveragexml
+
+# NuGet
+packages/
+*.nupkg
+
+# EF / dotnet tooling cache
+.store/
