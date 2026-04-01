@@ -47,5 +47,6 @@ app.MapGet(
             return Results.Ok(result);
         })
     .WithName("GetRoninPoolPrice");
+app.MapGet("/check", () => "Service is running");
 
 app.Run();
