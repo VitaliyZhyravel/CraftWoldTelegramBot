@@ -9,17 +9,20 @@ namespace WebApplication1.Services;
 
 public sealed class TelegramBotWorkflowService : ITelegramUpdateHandler
 {
+    private readonly IAlertRuntimeCache _runtimeCache;
     private readonly ApplicationDbContext _dbContext;
     private readonly IRoninPoolPriceService _priceService;
     private readonly ITelegramMessageClient _telegramMessageClient;
     private readonly ILogger<TelegramBotWorkflowService> _logger;
 
     public TelegramBotWorkflowService(
+        IAlertRuntimeCache runtimeCache,
         ApplicationDbContext dbContext,
         IRoninPoolPriceService priceService,
         ITelegramMessageClient telegramMessageClient,
         ILogger<TelegramBotWorkflowService> logger)
     {
+        _runtimeCache = runtimeCache;
         _dbContext = dbContext;
         _priceService = priceService;
         _telegramMessageClient = telegramMessageClient;
@@ -74,7 +77,8 @@ public sealed class TelegramBotWorkflowService : ITelegramUpdateHandler
 
         if (text.Equals("Delete Pair", StringComparison.OrdinalIgnoreCase))
         {
-            var subscriptions = await GetUserSubscriptionsAsync(user.Id, cancellationToken);
+            await _runtimeCache.InitializeAsync(cancellationToken);
+            var subscriptions = _runtimeCache.GetUserSubscriptions(user.Id);
             if (subscriptions.Count == 0)
             {
                 await _telegramMessageClient.SendTextMessageAsync(user.ChatId, "No active pairs.", cancellationToken: cancellationToken);
@@ -220,6 +224,7 @@ public sealed class TelegramBotWorkflowService : ITelegramUpdateHandler
 
         await ResetSessionAsync(session);
         await _dbContext.SaveChangesAsync(cancellationToken);
+        _runtimeCache.UpsertSubscription(trackedPool, subscription, user);
 
         await _telegramMessageClient.SendTextMessageAsync(
             user.ChatId,
@@ -270,13 +275,15 @@ public sealed class TelegramBotWorkflowService : ITelegramUpdateHandler
 
         await ResetSessionAsync(session);
         await _dbContext.SaveChangesAsync(cancellationToken);
+        _runtimeCache.DeactivateSubscription(subscription.Id, subscription.TrackedPoolId);
 
         await _telegramMessageClient.SendTextMessageAsync(user.ChatId, "Subscription deleted.", true, cancellationToken);
     }
 
     private async Task SendSubscriptionsAsync(TelegramUser user, CancellationToken cancellationToken)
     {
-        var subscriptions = await GetUserSubscriptionsAsync(user.Id, cancellationToken);
+        await _runtimeCache.InitializeAsync(cancellationToken);
+        var subscriptions = _runtimeCache.GetUserSubscriptions(user.Id);
         if (subscriptions.Count == 0)
         {
             await _telegramMessageClient.SendTextMessageAsync(user.ChatId, "No active pairs.", true, cancellationToken);
@@ -288,26 +295,6 @@ public sealed class TelegramBotWorkflowService : ITelegramUpdateHandler
             $"price = {(x.CurrentPrice.HasValue ? x.CurrentPrice.Value.ToString("F8") : "n/a")} | inverse = {(x.CurrentInversePrice.HasValue ? x.CurrentInversePrice.Value.ToString("F8") : "n/a")}"));
 
         await _telegramMessageClient.SendTextMessageAsync(user.ChatId, message, true, cancellationToken);
-    }
-
-    private async Task<List<TrackedPoolSubscriptionInfo>> GetUserSubscriptionsAsync(int userId, CancellationToken cancellationToken)
-    {
-        return await _dbContext.PriceAlertSubscriptions
-            .AsNoTracking()
-            .Include(x => x.TrackedPool)
-            .Where(x => x.TelegramUserId == userId && x.IsActive)
-            .OrderBy(x => x.Id)
-            .Select(x => new TrackedPoolSubscriptionInfo
-            {
-                SubscriptionId = x.Id,
-                PoolAddress = x.TrackedPool.PoolAddress,
-                PairLabel = x.TrackedPool.Token0Symbol + "/" + x.TrackedPool.Token1Symbol,
-                ThresholdPercent = x.ThresholdPercent,
-                BasePrice = x.BasePrice,
-                CurrentPrice = x.TrackedPool.LastKnownPrice,
-                CurrentInversePrice = x.TrackedPool.LastKnownInversePrice
-            })
-            .ToListAsync(cancellationToken);
     }
 
     private async Task<TelegramUser> GetOrCreateUserAsync(TelegramMessage message, CancellationToken cancellationToken)
@@ -330,6 +317,7 @@ public sealed class TelegramBotWorkflowService : ITelegramUpdateHandler
 
             _dbContext.TelegramUsers.Add(user);
             await _dbContext.SaveChangesAsync(cancellationToken);
+            _runtimeCache.UpdateTelegramUser(user);
             return user;
         }
 
@@ -338,6 +326,7 @@ public sealed class TelegramBotWorkflowService : ITelegramUpdateHandler
         user.FirstName = message.From.FirstName;
         user.UpdatedAtUtc = DateTime.UtcNow;
         await _dbContext.SaveChangesAsync(cancellationToken);
+        _runtimeCache.UpdateTelegramUser(user);
         return user;
     }
 

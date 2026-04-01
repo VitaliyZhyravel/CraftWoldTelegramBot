@@ -1,6 +1,7 @@
 using Microsoft.EntityFrameworkCore;
 using WebApplication1.Contracts;
 using WebApplication1.Data;
+using WebApplication1.Data.Entities;
 using WebApplication1.Models;
 using WebApplication1.Options;
 
@@ -10,21 +11,31 @@ public sealed class AlertMonitoringBackgroundService : BackgroundService
 {
     private readonly SemaphoreSlim _semaphore = new(1, 1);
     private readonly IServiceScopeFactory _scopeFactory;
+    private readonly IAlertRuntimeCache _runtimeCache;
+    private readonly IRoninPoolPriceService _priceService;
+    private readonly ITelegramMessageClient _telegramClient;
     private readonly ILogger<AlertMonitoringBackgroundService> _logger;
     private readonly TimeSpan _pollInterval;
 
     public AlertMonitoringBackgroundService(
         IServiceScopeFactory scopeFactory,
+        IAlertRuntimeCache runtimeCache,
+        IRoninPoolPriceService priceService,
+        ITelegramMessageClient telegramClient,
         Microsoft.Extensions.Options.IOptions<RoninPoolOptions> options,
         ILogger<AlertMonitoringBackgroundService> logger)
     {
         _scopeFactory = scopeFactory;
+        _runtimeCache = runtimeCache;
+        _priceService = priceService;
+        _telegramClient = telegramClient;
         _logger = logger;
         _pollInterval = TimeSpan.FromSeconds(Math.Max(1, options.Value.PollIntervalSeconds));
     }
 
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
+        await _runtimeCache.InitializeAsync(stoppingToken);
         using var timer = new PeriodicTimer(_pollInterval);
 
         while (!stoppingToken.IsCancellationRequested)
@@ -68,16 +79,7 @@ public sealed class AlertMonitoringBackgroundService : BackgroundService
 
     private async Task ProcessTickAsync(CancellationToken cancellationToken)
     {
-        using var scope = _scopeFactory.CreateScope();
-        var dbContext = scope.ServiceProvider.GetRequiredService<ApplicationDbContext>();
-        var priceService = scope.ServiceProvider.GetRequiredService<IRoninPoolPriceService>();
-        var telegramClient = scope.ServiceProvider.GetRequiredService<ITelegramMessageClient>();
-
-        var trackedPools = await dbContext.TrackedPools
-            .Where(x => x.IsActive)
-            .Where(x => x.Subscriptions.Any(s => s.IsActive))
-            .OrderBy(x => x.Id)
-            .ToListAsync(cancellationToken);
+        var trackedPools = _runtimeCache.GetActivePools();
 
         foreach (var trackedPool in trackedPools)
         {
@@ -85,7 +87,7 @@ public sealed class AlertMonitoringBackgroundService : BackgroundService
 
             try
             {
-                latestPrice = await priceService.GetPoolPriceAsync(trackedPool.PoolAddress, cancellationToken);
+                latestPrice = await _priceService.GetPoolPriceAsync(trackedPool.PoolAddress, cancellationToken);
             }
             catch (Exception ex) when (ex is not OperationCanceledException)
             {
@@ -93,23 +95,18 @@ public sealed class AlertMonitoringBackgroundService : BackgroundService
                 continue;
             }
 
-            trackedPool.Token0Address = latestPrice.Token0Address;
-            trackedPool.Token1Address = latestPrice.Token1Address;
-            trackedPool.Token0Symbol = latestPrice.Token0Symbol;
-            trackedPool.Token1Symbol = latestPrice.Token1Symbol;
-            trackedPool.LastKnownPrice = latestPrice.Price;
-            trackedPool.LastKnownInversePrice = latestPrice.InversePrice;
-            trackedPool.LastKnownTick = latestPrice.Tick;
-            trackedPool.LastPolledAtUtc = DateTime.UtcNow;
-            trackedPool.UpdatedAtUtc = DateTime.UtcNow;
+            var priceChanged = HasPriceChanged(trackedPool, latestPrice);
+            if (!priceChanged)
+            {
+                continue;
+            }
 
-            var subscriptions = await dbContext.PriceAlertSubscriptions
-                .Include(x => x.TelegramUser)
-                .Where(x => x.IsActive && x.TrackedPoolId == trackedPool.Id)
-                .OrderBy(x => x.Id)
-                .ToListAsync(cancellationToken);
+            var utcNow = DateTime.UtcNow;
+            _runtimeCache.UpdatePoolState(trackedPool.TrackedPoolId, latestPrice, utcNow);
 
-            foreach (var subscription in subscriptions)
+            var alertUpdates = new List<AlertPersistenceUpdate>();
+
+            foreach (var subscription in trackedPool.Subscriptions.OrderBy(x => x.SubscriptionId))
             {
                 var evaluation = Evaluate(subscription.BasePrice, latestPrice.Price, subscription.ThresholdPercent);
                 if (!evaluation.ShouldTrigger)
@@ -129,22 +126,28 @@ public sealed class AlertMonitoringBackgroundService : BackgroundService
 
                 try
                 {
-                    await telegramClient.SendTextMessageAsync(subscription.TelegramUser.ChatId, message, cancellationToken: cancellationToken);
-                    subscription.BasePrice = latestPrice.Price;
-                    subscription.LastAlertedAtUtc = DateTime.UtcNow;
-                    subscription.UpdatedAtUtc = DateTime.UtcNow;
+                    await _telegramClient.SendTextMessageAsync(subscription.ChatId, message, cancellationToken: cancellationToken);
+                    alertUpdates.Add(new AlertPersistenceUpdate
+                    {
+                        SubscriptionId = subscription.SubscriptionId,
+                        BasePrice = latestPrice.Price,
+                        AlertedAtUtc = utcNow
+                    });
                 }
                 catch (Exception ex) when (ex is not OperationCanceledException)
                 {
                     _logger.LogError(
                         ex,
                         "Failed to send alert for subscription {SubscriptionId} and pool {PoolAddress}",
-                        subscription.Id,
+                        subscription.SubscriptionId,
                         trackedPool.PoolAddress);
                 }
             }
 
-            await dbContext.SaveChangesAsync(cancellationToken);
+            if (alertUpdates.Count > 0)
+            {
+                await PersistAlertUpdatesAsync(alertUpdates, cancellationToken);
+            }
 
             _logger.LogInformation(
                 "Ronin pool price updated: {Token0}/{Token1} = {Price}, inverse = {InversePrice}, tick = {Tick}",
@@ -154,6 +157,44 @@ public sealed class AlertMonitoringBackgroundService : BackgroundService
                 latestPrice.InversePrice,
                 latestPrice.Tick);
         }
+    }
+
+    private async Task PersistAlertUpdatesAsync(
+        IReadOnlyCollection<AlertPersistenceUpdate> alertUpdates,
+        CancellationToken cancellationToken)
+    {
+        using var scope = _scopeFactory.CreateScope();
+        var dbContext = scope.ServiceProvider.GetRequiredService<ApplicationDbContext>();
+
+        foreach (var alertUpdate in alertUpdates)
+        {
+            var subscription = new PriceAlertSubscription
+            {
+                Id = alertUpdate.SubscriptionId
+            };
+
+            dbContext.PriceAlertSubscriptions.Attach(subscription);
+            subscription.BasePrice = alertUpdate.BasePrice;
+            subscription.LastAlertedAtUtc = alertUpdate.AlertedAtUtc;
+            subscription.UpdatedAtUtc = alertUpdate.AlertedAtUtc;
+
+            dbContext.Entry(subscription).Property(x => x.BasePrice).IsModified = true;
+            dbContext.Entry(subscription).Property(x => x.LastAlertedAtUtc).IsModified = true;
+            dbContext.Entry(subscription).Property(x => x.UpdatedAtUtc).IsModified = true;
+        }
+
+        await dbContext.SaveChangesAsync(cancellationToken);
+
+        foreach (var alertUpdate in alertUpdates)
+        {
+            _runtimeCache.ApplyAlertUpdate(alertUpdate.SubscriptionId, alertUpdate.BasePrice, alertUpdate.AlertedAtUtc);
+        }
+    }
+
+    private static bool HasPriceChanged(TrackedPoolRuntimeSnapshot trackedPool, PoolPriceResult latestPrice)
+    {
+        return trackedPool.CurrentPrice != latestPrice.Price ||
+               trackedPool.CurrentTick != latestPrice.Tick;
     }
 
     private static AlertEvaluationResult Evaluate(decimal basePrice, decimal currentPrice, decimal thresholdPercent)

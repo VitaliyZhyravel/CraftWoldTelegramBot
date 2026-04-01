@@ -14,10 +14,12 @@ builder.Services.Configure<TelegramBotOptions>(builder.Configuration.GetSection(
 builder.Services.AddDbContext<ApplicationDbContext>(options =>
     options.UseSqlite(builder.Configuration.GetConnectionString("DefaultConnection")));
 builder.Services.AddSingleton<IRoninPoolPriceService, RoninPoolPriceService>();
+builder.Services.AddSingleton<IAlertRuntimeCache, AlertRuntimeCache>();
 builder.Services.AddScoped<ITelegramUpdateHandler, TelegramBotWorkflowService>();
 builder.Services.AddHttpClient<ITelegramMessageClient, TelegramMessageClient>();
 builder.Services.AddHttpClient<TelegramWebhookRegistrationService>();
 builder.Services.AddScoped<ApplicationDbInitializer>();
+builder.Services.AddHostedService<AlertRuntimeCacheWarmupService>();
 builder.Services.AddHostedService<AlertMonitoringBackgroundService>();
 builder.Services.AddHostedService(sp => sp.GetRequiredService<TelegramWebhookRegistrationService>());
 
