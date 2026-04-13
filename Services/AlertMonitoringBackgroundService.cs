@@ -117,10 +117,8 @@ public sealed class AlertMonitoringBackgroundService : BackgroundService
                 var pairLabel = $"{latestPrice.Token0Symbol}/{latestPrice.Token1Symbol}";
                 var message =
                     $"Alert {pairLabel}\n" +
-                    $"Pool: {trackedPool.PoolAddress}\n" +
                     $"Price: {latestPrice.Price:F8}\n" +
                     $"Inverse: {latestPrice.InversePrice:F8}\n" +
-                    $"Base: {subscription.BasePrice:F8}\n" +
                     $"Change: {evaluation.ChangePercent:+0.##;-0.##}%\n" +
                     $"Threshold: {subscription.ThresholdPercent:0.##}%";
 
