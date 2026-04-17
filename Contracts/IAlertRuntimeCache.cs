@@ -19,5 +19,5 @@ public interface IAlertRuntimeCache
 
     void UpdatePoolState(int trackedPoolId, PoolPriceResult latestPrice, DateTime polledAtUtc);
 
-    void ApplyAlertUpdate(int subscriptionId, decimal newBasePrice, DateTime alertedAtUtc);
+    void ApplyAlertUpdate(int subscriptionId, decimal newBasePrice, DateTime? alertedAtUtc);
 }

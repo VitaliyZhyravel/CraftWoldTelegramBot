@@ -6,5 +6,7 @@ public sealed class AlertPersistenceUpdate
 
     public required decimal BasePrice { get; init; }
 
-    public required DateTime AlertedAtUtc { get; init; }
+    public DateTime? AlertedAtUtc { get; init; }
+
+    public required DateTime UpdatedAtUtc { get; init; }
 }

@@ -9,6 +9,7 @@ namespace WebApplication1.Services;
 
 public sealed class AlertMonitoringBackgroundService : BackgroundService
 {
+    private const decimal SilentBasePriceUpdatePercent = 1m;
     private readonly SemaphoreSlim _semaphore = new(1, 1);
     private readonly IServiceScopeFactory _scopeFactory;
     private readonly IAlertRuntimeCache _runtimeCache;
@@ -95,8 +96,7 @@ public sealed class AlertMonitoringBackgroundService : BackgroundService
                 continue;
             }
 
-            var priceChanged = HasPriceChanged(trackedPool, latestPrice);
-            if (!priceChanged)
+            if (!HasPriceChanged(trackedPool, latestPrice))
             {
                 continue;
             }
@@ -104,47 +104,59 @@ public sealed class AlertMonitoringBackgroundService : BackgroundService
             var utcNow = DateTime.UtcNow;
             _runtimeCache.UpdatePoolState(trackedPool.TrackedPoolId, latestPrice, utcNow);
 
-            var alertUpdates = new List<AlertPersistenceUpdate>();
+            var subscriptionUpdates = new List<AlertPersistenceUpdate>();
 
             foreach (var subscription in trackedPool.Subscriptions.OrderBy(x => x.SubscriptionId))
             {
                 var evaluation = Evaluate(subscription.BasePrice, latestPrice.Price, subscription.ThresholdPercent);
-                if (!evaluation.ShouldTrigger)
+
+                if (evaluation.ShouldTriggerAlert)
                 {
+                    var pairLabel = $"{latestPrice.Token0Symbol}/{latestPrice.Token1Symbol}";
+                    var message =
+                        $"Alert {pairLabel}\n" +
+                        $"Price: {latestPrice.Price:F8}\n" +
+                        $"Inverse: {latestPrice.InversePrice:F8}\n" +
+                        $"Change: {evaluation.ChangePercent:+0.##;-0.##}%\n" +
+                        $"Threshold: {subscription.ThresholdPercent:0.##}%";
+
+                    try
+                    {
+                        await _telegramClient.SendTextMessageAsync(subscription.ChatId, message, cancellationToken: cancellationToken);
+                        subscriptionUpdates.Add(new AlertPersistenceUpdate
+                        {
+                            SubscriptionId = subscription.SubscriptionId,
+                            BasePrice = latestPrice.Price,
+                            AlertedAtUtc = utcNow,
+                            UpdatedAtUtc = utcNow
+                        });
+                    }
+                    catch (Exception ex) when (ex is not OperationCanceledException)
+                    {
+                        _logger.LogError(
+                            ex,
+                            "Failed to send alert for subscription {SubscriptionId} and pool {PoolAddress}",
+                            subscription.SubscriptionId,
+                            trackedPool.PoolAddress);
+                    }
+
                     continue;
                 }
 
-                var pairLabel = $"{latestPrice.Token0Symbol}/{latestPrice.Token1Symbol}";
-                var message =
-                    $"Alert {pairLabel}\n" +
-                    $"Price: {latestPrice.Price:F8}\n" +
-                    $"Inverse: {latestPrice.InversePrice:F8}\n" +
-                    $"Change: {evaluation.ChangePercent:+0.##;-0.##}%\n" +
-                    $"Threshold: {subscription.ThresholdPercent:0.##}%";
-
-                try
+                if (evaluation.ShouldUpdateBasePrice)
                 {
-                    await _telegramClient.SendTextMessageAsync(subscription.ChatId, message, cancellationToken: cancellationToken);
-                    alertUpdates.Add(new AlertPersistenceUpdate
+                    subscriptionUpdates.Add(new AlertPersistenceUpdate
                     {
                         SubscriptionId = subscription.SubscriptionId,
                         BasePrice = latestPrice.Price,
-                        AlertedAtUtc = utcNow
+                        UpdatedAtUtc = utcNow
                     });
-                }
-                catch (Exception ex) when (ex is not OperationCanceledException)
-                {
-                    _logger.LogError(
-                        ex,
-                        "Failed to send alert for subscription {SubscriptionId} and pool {PoolAddress}",
-                        subscription.SubscriptionId,
-                        trackedPool.PoolAddress);
                 }
             }
 
-            if (alertUpdates.Count > 0)
+            if (subscriptionUpdates.Count > 0)
             {
-                await PersistAlertUpdatesAsync(alertUpdates, cancellationToken);
+                await PersistSubscriptionUpdatesAsync(subscriptionUpdates, cancellationToken);
             }
 
             _logger.LogInformation(
@@ -157,35 +169,42 @@ public sealed class AlertMonitoringBackgroundService : BackgroundService
         }
     }
 
-    private async Task PersistAlertUpdatesAsync(
-        IReadOnlyCollection<AlertPersistenceUpdate> alertUpdates,
+    private async Task PersistSubscriptionUpdatesAsync(
+        IReadOnlyCollection<AlertPersistenceUpdate> subscriptionUpdates,
         CancellationToken cancellationToken)
     {
         using var scope = _scopeFactory.CreateScope();
         var dbContext = scope.ServiceProvider.GetRequiredService<ApplicationDbContext>();
 
-        foreach (var alertUpdate in alertUpdates)
+        foreach (var subscriptionUpdate in subscriptionUpdates)
         {
             var subscription = new PriceAlertSubscription
             {
-                Id = alertUpdate.SubscriptionId
+                Id = subscriptionUpdate.SubscriptionId
             };
 
             dbContext.PriceAlertSubscriptions.Attach(subscription);
-            subscription.BasePrice = alertUpdate.BasePrice;
-            subscription.LastAlertedAtUtc = alertUpdate.AlertedAtUtc;
-            subscription.UpdatedAtUtc = alertUpdate.AlertedAtUtc;
+            subscription.BasePrice = subscriptionUpdate.BasePrice;
+            subscription.UpdatedAtUtc = subscriptionUpdate.UpdatedAtUtc;
 
             dbContext.Entry(subscription).Property(x => x.BasePrice).IsModified = true;
-            dbContext.Entry(subscription).Property(x => x.LastAlertedAtUtc).IsModified = true;
             dbContext.Entry(subscription).Property(x => x.UpdatedAtUtc).IsModified = true;
+
+            if (subscriptionUpdate.AlertedAtUtc.HasValue)
+            {
+                subscription.LastAlertedAtUtc = subscriptionUpdate.AlertedAtUtc;
+                dbContext.Entry(subscription).Property(x => x.LastAlertedAtUtc).IsModified = true;
+            }
         }
 
         await dbContext.SaveChangesAsync(cancellationToken);
 
-        foreach (var alertUpdate in alertUpdates)
+        foreach (var subscriptionUpdate in subscriptionUpdates)
         {
-            _runtimeCache.ApplyAlertUpdate(alertUpdate.SubscriptionId, alertUpdate.BasePrice, alertUpdate.AlertedAtUtc);
+            _runtimeCache.ApplyAlertUpdate(
+                subscriptionUpdate.SubscriptionId,
+                subscriptionUpdate.BasePrice,
+                subscriptionUpdate.AlertedAtUtc);
         }
     }
 
@@ -201,16 +220,29 @@ public sealed class AlertMonitoringBackgroundService : BackgroundService
         {
             return new AlertEvaluationResult
             {
-                ShouldTrigger = false,
+                ShouldTriggerAlert = false,
+                ShouldUpdateBasePrice = false,
                 ChangePercent = 0
             };
         }
 
         var changePercent = ((currentPrice - basePrice) / basePrice) * 100m;
+        var absoluteChangePercent = Math.Abs(changePercent);
+
+        if (absoluteChangePercent >= thresholdPercent)
+        {
+            return new AlertEvaluationResult
+            {
+                ShouldTriggerAlert = true,
+                ShouldUpdateBasePrice = true,
+                ChangePercent = changePercent
+            };
+        }
 
         return new AlertEvaluationResult
         {
-            ShouldTrigger = Math.Abs(changePercent) >= thresholdPercent,
+            ShouldTriggerAlert = false,
+            ShouldUpdateBasePrice = absoluteChangePercent >= SilentBasePriceUpdatePercent,
             ChangePercent = changePercent
         };
     }

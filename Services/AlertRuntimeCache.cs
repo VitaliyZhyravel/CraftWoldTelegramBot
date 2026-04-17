@@ -135,7 +135,7 @@ public sealed class AlertRuntimeCache : IAlertRuntimeCache
         }
     }
 
-    public void ApplyAlertUpdate(int subscriptionId, decimal newBasePrice, DateTime alertedAtUtc)
+    public void ApplyAlertUpdate(int subscriptionId, decimal newBasePrice, DateTime? alertedAtUtc)
     {
         if (_subscriptionToPoolMap.TryGetValue(subscriptionId, out var trackedPoolId) &&
             _pools.TryGetValue(trackedPoolId, out var cachedPool))
@@ -231,7 +231,7 @@ public sealed class AlertRuntimeCache : IAlertRuntimeCache
             _subscriptions.TryRemove(subscriptionId, out _);
         }
 
-        public void ApplyAlertUpdate(int subscriptionId, decimal newBasePrice, DateTime alertedAtUtc)
+        public void ApplyAlertUpdate(int subscriptionId, decimal newBasePrice, DateTime? alertedAtUtc)
         {
             if (_subscriptions.TryGetValue(subscriptionId, out var subscription))
             {
@@ -343,12 +343,15 @@ public sealed class AlertRuntimeCache : IAlertRuntimeCache
             }
         }
 
-        public void ApplyAlertUpdate(decimal newBasePrice, DateTime alertedAtUtc)
+        public void ApplyAlertUpdate(decimal newBasePrice, DateTime? alertedAtUtc)
         {
             lock (_gate)
             {
                 BasePrice = newBasePrice;
-                LastAlertedAtUtc = alertedAtUtc;
+                if (alertedAtUtc.HasValue)
+                {
+                    LastAlertedAtUtc = alertedAtUtc;
+                }
             }
         }
 
